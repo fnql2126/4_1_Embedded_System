@@ -1,0 +1,279 @@
+#include <wiringPi.h>
+#include <wiringPiSPI.h>
+#include <pthread.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include </usr/include/mysql/mysql.h>
+
+#define MAX 10000
+#define MAXTIMINGS 85
+
+#define CS_MCP3208 24
+#define SPI_CHANNEL 0
+#define SPI_SPEED 1000000
+
+#define FAN 22
+#define LED 7
+
+#define DB_HOST "192.168.1.106"
+#define DB_USER "root"
+#define DB_PASS "root"
+#define DB_NAME "embedded"
+
+typedef struct data{
+    int temp;
+    int light;
+}data;
+
+
+data buffer[MAX];
+int fill_ptr = 0;
+int use_ptr = -1;
+int pop_ptr = 0;
+int count = 0;
+int flag = 1;
+
+pthread_cond_t empty, fill, fan, led;
+pthread_mutex_t mutex;
+
+int ret_temp;
+static int DHTPIN = 11;
+static int dht22_dat[5] = { 0, 0, 0, 0, 0 };
+
+MYSQL *conn;
+
+static uint8_t sizecvt(const int read){
+    if(read > 255 || read < 0){
+        printf("Invalid data from wiringPi library\n");
+        exit(EXIT_FAILURE);
+    }
+    return (uint8_t)read;
+}
+int read_dht22_dat(){
+    uint8_t laststate=HIGH;
+    uint8_t counter=0;
+    uint8_t j=0, i;
+
+    dht22_dat[0]=dht22_dat[1]=dht22_dat[2]=dht22_dat[3]=dht22_dat[4]=0;
+    pinMode(DHTPIN, OUTPUT);
+    digitalWrite(DHTPIN, HIGH);
+    delay(10);
+    digitalWrite(DHTPIN, LOW);
+    delay(18);
+    digitalWrite(DHTPIN, HIGH);
+    delayMicroseconds(40);
+    pinMode(DHTPIN, INPUT);
+    for(i=0; i<MAXTIMINGS; i++){
+        counter=0;
+        while(sizecvt(digitalRead(DHTPIN))==laststate){
+            counter++;
+            delayMicroseconds(1);
+            if(counter==255)
+                break;
+        }
+        laststate=sizecvt(digitalRead(DHTPIN));
+        if(counter==255)
+            break;
+        if((i>=4)&&(i%2==0)){
+            dht22_dat[j/8]<<=1;
+            if(counter>50)
+                dht22_dat[j/8]|=1;
+            j++;
+        }
+    }
+    if((j>=40)&&(dht22_dat[4]==((dht22_dat[0]+dht22_dat[1]+dht22_dat[2]+dht22_dat[3])&0xFF))){
+        float t;
+        t=(float)(dht22_dat[2]&0x7F)*256+(float)dht22_dat[3];
+        t/=10.0;
+        if((dht22_dat[2]&0x80)!=0)
+            t*=-1;
+        ret_temp=(int)t;
+        return ret_temp;
+    }
+}
+
+int read_mcp3208_adc(unsigned char adcChannel){
+    unsigned char buff[3];
+    int adcValue = 0;
+
+    buff[0] = 0x06 | ((adcChannel & 0x07) >> 2);
+    buff[1] = ((adcChannel & 0x07) << 6);
+    buff[2] = 0x00;
+
+    digitalWrite(CS_MCP3208, 0);
+    wiringPiSPIDataRW(SPI_CHANNEL, buff, 3);
+
+    buff[1] = 0x0f & buff[1];
+    adcValue = (buff[1] << 8) | buff[2];
+
+    digitalWrite(CS_MCP3208, 1);
+
+    return adcValue;
+}
+
+void put(data value){
+    buffer[fill_ptr] = value;
+    fill_ptr = (fill_ptr + 1) % MAX;
+    count++;
+}
+
+data get(){
+    data tmp = buffer[use_ptr];
+    return tmp;
+}
+
+data pop(){
+    data tmp = buffer[pop_ptr];
+    pop_ptr = (pop_ptr + 1) % MAX;
+    count--;
+    return tmp;
+}
+void* monitor_sensor(void* arg){
+    data received_data;
+    unsigned char adcChannel_light = 0;
+
+    while (1){
+        pthread_mutex_lock(&mutex);
+
+        flag = 1;
+        while(count == MAX)
+            pthread_cond_wait(&empty, &mutex);
+
+        while(read_dht22_dat() == 0)
+            delay(500);
+
+        received_data.temp = ret_temp;
+        received_data.light = read_mcp3208_adc(adcChannel_light);
+        printf("Temperature = %d\n", received_data.temp);
+        printf("Light = %u\n", received_data.light);
+        put(received_data);
+        if(received_data.temp >= 26){
+            flag = 3;
+            pthread_cond_signal(&fan);
+            pthread_mutex_unlock(&mutex);
+            usleep(5);
+            pthread_mutex_lock(&mutex);
+        }
+        flag = 4;
+        pthread_cond_signal(&led);
+        pthread_mutex_unlock(&mutex);
+        sleep(0.05);
+    }
+}
+
+void* send_data(void* arg){
+    int query_stat;
+    MYSQL_RES *sql_result;
+    char query[100];
+    data get_data;
+    while (1){
+        pthread_mutex_lock(&mutex);
+        while (count == 0)
+            pthread_cond_wait(&fill, &mutex);
+
+        printf("send data\n");
+        while(count > 0){
+            get_data = pop();
+            //printf("send_data : %d %d\n", get_data.temp, get_data.light);
+            sprintf(query, "insert into smart_farm value('%d', '%d')", get_data.temp, get_data.light, 100);
+            query_stat = mysql_query(conn, query);
+        }
+        pthread_cond_signal(&empty);
+        pthread_mutex_unlock(&mutex);
+        sleep(10);
+    }
+}
+
+void* control_fan(void* arg){
+    data get_data;
+
+    while (1){
+        pthread_mutex_lock(&mutex);
+
+        while(flag != 3)
+            pthread_cond_wait(&fan, &mutex);
+
+        //printf("start p3\n");
+        get_data = get();
+        if (get_data.temp >= 25){
+            digitalWrite(FAN, 1);
+        }
+        flag = 1;
+        pthread_mutex_unlock(&mutex);
+        if(get_data.temp >= 27)
+            sleep(5);
+        digitalWrite(FAN, 0);
+    }
+}
+void* control_led(void* arg){
+    data get_data;
+
+    while (1){
+        pthread_mutex_lock(&mutex);
+
+        while(flag != 4)
+            pthread_cond_wait(&led, &mutex);
+
+        //printf("start p4\n");
+        get_data = get();
+        if (get_data.light < 800){
+            digitalWrite(LED, 0);
+        }
+        else
+            digitalWrite(LED, 1);
+        flag = 1;
+        use_ptr = (use_ptr + 1) %  MAX;
+        pthread_mutex_unlock(&mutex);
+    }
+}
+
+int main(int argc, char* argv[]){
+    pthread_t p1, p2, p3, p4;
+    MYSQL connection;
+    flag = 0;
+
+    mysql_init(&connection);
+    conn = mysql_real_connect(&connection, DB_HOST, DB_USER, DB_PASS,
+        DB_NAME, 3306, (char*)NULL, 0);
+    if(conn == NULL)
+        printf("Mysql Connection Error\n");
+
+    if(wiringPiSetup() == -1){
+        fprintf(stdout, "Unable to start wiringPi : %s\n", strerror(errno));
+        return 1;
+    }
+
+    if(wiringPiSPISetup(SPI_CHANNEL, SPI_SPEED) == -1){
+        fprintf(stdout, "Unable to start wringPi : %s\n", strerror(errno));
+        return 1;
+    }
+
+    pinMode(FAN, OUTPUT);
+    digitalWrite(FAN, 0);
+    pinMode(LED, OUTPUT);
+    digitalWrite(LED, 0);
+
+    pthread_create(&p1, NULL, monitor_sensor, NULL);
+    pthread_create(&p2, NULL, send_data, NULL);
+    pthread_create(&p3, NULL, control_fan, NULL);
+    pthread_create(&p4, NULL, control_led, NULL);
+
+    pthread_join(p1, NULL);
+    pthread_join(p2, NULL);
+    pthread_join(p3, NULL);
+    pthread_join(p4, NULL);
+
+    pthread_exit(&p1);
+    pthread_exit(&p2);
+    pthread_exit(&p3);
+    pthread_exit(&p4);
+
+    return 0;
+}
