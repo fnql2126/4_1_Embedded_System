@@ -13,5 +13,5 @@
 (3) 10초마다 2번 스레드가 실행되면서 데이터 값을 DB로 보냅니다.  
 (4) 각각의 스레드는 독립적으로 동작합니다.  
 5. youtube 주소는 다음과 같습니다.  
-https://www.youtube.com/watch?v=8kDjz7bvFhQ
+https://www.youtube.com/watch?v=8kDjz7bvFhQ  
    
