@@ -202,12 +202,12 @@ void* control_fan(void* arg){
 
         //printf("start p3\n");
         get_data = get();
-        if (get_data.temp >= 25){
+        if (get_data.temp >= 26){
             digitalWrite(FAN, 1);
         }
         flag = 1;
         pthread_mutex_unlock(&mutex);
-        if(get_data.temp >= 27)
+        if(get_data.temp >= 26)
             sleep(5);
         digitalWrite(FAN, 0);
     }
