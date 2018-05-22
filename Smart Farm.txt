@@ -224,10 +224,10 @@ void* control_led(void* arg){
         //printf("start p4\n");
         get_data = get();
         if (get_data.light < 800){
-            digitalWrite(LED, 0);
+            digitalWrite(LED, 1);
         }
         else
-            digitalWrite(LED, 1);
+            digitalWrite(LED, 0);
         flag = 1;
         use_ptr = (use_ptr + 1) %  MAX;
         pthread_mutex_unlock(&mutex);
